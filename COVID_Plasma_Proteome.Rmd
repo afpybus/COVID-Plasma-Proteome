@@ -1,0 +1,513 @@
+---
+title: "COVID-19 Plasma Proteome"
+author: "Alyssa Pybus"
+date: '2-4 August 2023'
+output: github_document
+bibliography: references.bib
+---
+
+## Summary
+
+Explore the COVID-19 Plasma Proteome [Olink dataset](https://olink.com/application/mgh-covid-19-study/) from [a research study](https://www.cell.com/cell-reports-medicine/fulltext/S2666-3791(21)00115-4#%20) conducted by Massachusetts General Hospital [@filbin2021]. My approach was to conduct an exploratory analysis using weighted correlation network analysis / weighted gene co-expression analysis (WGCNA) to pull out major trends in the data.
+
+#### Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center", warning = FALSE)
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path)) # set working directory to this file location
+rm(list = ls()) # clear Global Environment for fresh run
+pacman::p_load(tidyverse)
+```
+
+### Load in the Olink NPX data
+
+NPX = Normalized Protein Expression
+
+[Pre-processing steps by Olink](https://olink.com/faq/how-is-the-npx-value-calculated-in-explore/){.uri}
+
+```{r load_data}
+df_in = rio::import("MGH_COVID_OLINK_NPX.txt")
+df_in$NPX[df_in$QC_Warning=="WARN" | df_in$Assay_Warning=="WARN"] = NA
+
+glimpse(df_in)
+```
+
+### Load in the clinical data
+
+```{r load_clinical}
+clinical = rio::import("MGH_COVID_Clinical_Info.txt")
+
+glimpse(clinical)
+```
+
+### Format the data for follow-on analysis
+
+#### Observations matrix
+
+In this chunk, I create a matrix where rows (observations) are a single plasma sample (single patient on a single day) and columns are measured proteins (the input configuration for WGCNA). I preferentially use OlinkID because the Assay and UnitProt identifiers are not unique.
+
+```{r observations}
+df_obs = df_in %>% 
+  filter(subject_id > 0) %>%
+  select(SampleID,subject_id,Timepoint,OlinkID,NPX) %>%
+  spread(key="OlinkID",value="NPX")
+
+obs_mat = df_obs[,4:ncol(df_obs)] %>% as.matrix()
+rownames(obs_mat) = df_obs$SampleID
+
+glimpse(df_obs[,1:8])
+```
+
+#### Information (clinical) matrix
+
+I also create a matching "info" data frame with sample rows in identical order to use as metadata for follow-on analyses.
+
+```{r format_info}
+info = df_obs %>%
+  select(SampleID,subject_id,Timepoint) %>%
+  left_join(clinical,by = "subject_id") %>%
+  mutate(subject_id = factor(subject_id))
+
+# Create new variables in info for concurrent measurements
+replace = colnames(info)[which(str_detect(colnames(info),"_0"))] %>% str_c("_")
+new_var = gsub("_0.*","",x = replace)
+for(var in new_var){
+  info$new = case_when(
+    info$Timepoint == "D0" ~ info[,str_detect(colnames(info),str_c(var,"_0"))],
+    info$Timepoint == "D3" ~ info[,str_detect(colnames(info),str_c(var,"_3"))],
+    info$Timepoint == "D7" ~ info[,str_detect(colnames(info),str_c(var,"_7"))],
+  )
+  colnames(info)[which(colnames(info)=="new")] = var
+}
+
+glimpse(info)
+```
+
+## Weighted "Gene" Co-expression Network Analysis
+
+WGCNA identifies modules of co-varying analytes (usually genes but in this case, proteins) to identify broad trends within the data. The functions come from the [WGCNA package](https://cran.r-project.org/web/packages/WGCNA/index.html) available on CRAN [@langfelder2008].
+
+### Pick soft threshold power
+
+The function WGCNA::pickSoftThreshold() helps us to select a power to apply to the correlation matrix and thus reduce noise within the data. The most common method for power selection is to select the lowest integer for which R\^2 \> 0.80 for the network with a scale-free topology model.
+
+```{r pick_threshold, fig.height=5, fig.width=5}
+# ~~~ Select threshold power ~~~~~~~~~
+sft = WGCNA::pickSoftThreshold(obs_mat, verbose = 5)
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=sft$fitIndices$Power,cex=0.9,col="red");
+abline(h=0.80,col="red")
+
+power = sft$fitIndices$Power[sft$fitIndices$SFT.R.sq>0.8] %>% min()
+```
+
+A threshold power of `r power` was chosen since it was the smallest threshold that resulted in a scale-free local max R\^2 value greater than 0.80
+
+### Scale free topology visualization
+
+```{r sft_vis, message=FALSE,fig.width=6.5, fig.height=4}
+# Adjacency matrix is the correlation coefficient to power beta (determined above)
+adjacency_mat=abs(cor(obs_mat,use="p"))^power
+# Connectivity k is the sum of all adjacencies of a protein
+k=as.vector(apply(adjacency_mat,2,sum, na.rm=T))
+
+# Visualize the histogram of k values and the power law distribution
+par(mfrow=c(1,2))
+hist(k)
+WGCNA::scaleFreePlot(k, main="Check scale free topology\n") %>% invisible()
+```
+
+### Run WGCNA to calculate modules
+
+Parameters for blockwiseModules() are adapted from [this paper](https://www.nature.com/articles/s41593-021-00999-y) [@johnson2022].
+
+```{r wgcna, message=FALSE,eval=FALSE}
+# Run WGCNA #################
+library("WGCNA")
+net = WGCNA::blockwiseModules(obs_mat, 
+                              power = power, 
+                              networkType = "signed",
+                              deepSplit = 4,
+                              minModuleSize = 20,
+                              TOMDenom = "mean",
+                              corType = "bicor",
+                              mergeCutHeight = 0.07,
+                              reassignThreshold = 0.05,
+                              numericLabels = T,
+                              verbose = 3,
+                              maxBlockSize = 1500)
+# saveRDS(net,"net.rds")
+```
+
+```{r load_net, include=FALSE}
+library("WGCNA")
+net = readRDS("net.rds")
+```
+
+### Set up color scheme
+
+```{r colors}
+colors_num =net$colors # save original number labels
+net[["colors"]] = labels2colors(net$colors) # set color labels
+color_code = data.frame(table(colors_num)) # create data frame to transition between numbers and colors
+color_code$color = labels2colors(color_code$colors_num %>% as.character() %>% as.numeric())
+
+table(net$colors)
+```
+
+### Visualize the module dendrogram
+
+```{r dendro, fig.height=4, fig.width=9}
+WGCNA::plotDendroAndColors(net$dendrograms[[1]], net$colors[net$blockGenes[[1]]],
+                    dendroLabels = FALSE,hang=0.03,addGuide = TRUE,guideHang = 0.05)
+```
+
+Using deepSplit = 4 (highest sensitivity level for module reassignment) usually gives somewhat messy module dendrograms, but in my experience has led to greater biological relevance within modules.
+
+### Assess similarity between modules
+
+```{r module_eigengenes}
+ME_tree = hclust(dist(t(net$MEs)), method = "average")
+MEs = net$MEs[,ME_tree$order]
+ME_mat = MEs %>% as.matrix()
+
+plot(ME_tree, main = "ME clustering", sub="", xlab="",)
+```
+
+ME3 and 5 are quite similar to each other and distinct from all other modules.
+
+### Variance partition analysis of modules
+
+Variance Partition Analysis (VPA) allows us to identify the major sources of variance within our data. We specify information about each sample (i.e. COVID status, age group, etc.) and the functions calculate what proportion of each ME's variance can be explained by each factor. This analysis uses the [variancePartition package](https://bioconductor.org/packages/release/bioc/html/variancePartition.html) available on Bioconductor [@hoffman2016].
+
+#### VPA - Canonical correlation analysis
+
+```{r cca, fig.height=7,fig.width=7, message=FALSE}
+form <- ~ COVID + Acuity + Age_cat + BMI_cat + HEART + LUNG + KIDNEY + DIABETES + HTN + IMMUNO + Resp_Symp + Fever_Sympt + GI_Symp + abs_neut + abs_lymph + abs_mono + creat + crp + ddimer + ldh
+C = variancePartition::canCorPairs(form,info)
+variancePartition::plotCorrMatrix( C )
+```
+
+This heatmap is showing that there's a fair amount of co-variance between many of the quantitative measurements (crp, ldh, ddimer) and acuity, as well as between creatine and kidney disease. This might cause issues in the variance partition analysis, which attempts to separate each source of variance from all others and determine an estimated % contribution from each one. For co-varying factors, it's harder to separate the two and I've found that VPA usually tends to pick the stronger factor and give it the lion's share of the variance at the expense of the weaker co-variate.
+
+#### VPA - All variables
+
+```{r vpa_all, fig.height=3.5,fig.width=6, message=FALSE}
+vp_all <- variancePartition::fitExtractVarPartModel(t(MEs), form, info )
+variancePartition::plotPercentBars(vp_all[order(vp_all$Residuals),] )
+```
+
+Probably the most notable feature here is the impact of creatine on modules 1 and 3. Module 1 seems to have a slight impact from acuity, but module 3 is more influenced by COVID status. Module 0 is formed from all the unassigned proteins, so this one isn't particularly meaningful.
+
+#### VPA - Qualitative variables
+
+Because the quantitative measurements seemed to eclipse much of the variance from qualitative factors, I decided to do two more VPAs with factor subsets of both groups. I was interested to see how much of the modules could be explained without data from a blood draw (what are the risk factors behind each subset of proteins acting in a distinct pattern?).
+
+```{r vpa_qual_bars, fig.height=3.5,fig.width=4, message=FALSE}
+form_qual <- ~ COVID + Acuity + Age_cat + BMI_cat + HEART + LUNG + KIDNEY + DIABETES + HTN + IMMUNO + Resp_Symp + Fever_Sympt + GI_Symp
+vp_qual <- variancePartition::fitExtractVarPartModel(t(MEs), form_qual, info )
+variancePartition::plotPercentBars(vp_qual[order(vp_qual$Residuals),] )
+```
+
+ME1 was again the most interesting to me. It's acuity score shot up, as it was likely being masked by the co-varying quantitative variables "taking" its variance. It's also interesting to see such a strong contribution of pre-existing kidney disease. ME3 still shows a contribution from COVID, but it's notably not really associated with acuity. Kidney disease also seems to impact ME3.
+
+#### VPA - Quantitative variables
+
+Next, we'll look at ME variance for quantitative variables.
+
+```{r vpa, fig.height=3.5,fig.width=4, message=FALSE}
+form_quant <- ~ abs_neut + abs_lymph + abs_mono + creat + crp + ddimer + ldh
+vp_quant <- variancePartition::fitExtractVarPartModel(t(MEs), form_quant, info )
+variancePartition::plotPercentBars(vp_quant[order(vp_quant$Residuals),] )
+```
+
+This looks much like the all-factors VPA. At this point I'm really interested by what's going on with creatine in particular.
+
+### Linear Regressions
+
+To assess the directionality of the relationships between each variable and each module, I next conduct ordinary linear regression and save the correlation coefficients and p-values to combine with the variance data.
+
+```{r regressions, message=FALSE}
+factors = colnames(vp_all)[colnames(vp_all) != "Residuals"]
+factor_mat = info %>%
+  select(all_of(factors)) %>%
+  as.matrix()
+# identical(info$SampleID,rownames(ME_mat))
+regressions = cbind(ME_mat,factor_mat)
+corMat= Hmisc::rcorr(regressions)
+corCoefs = corMat$r %>%
+  as_tibble() %>%
+  mutate(ME = rownames(corMat$r)) %>%
+  filter(ME %in% colnames(MEs)) %>%
+  select(ME,factors) %>%
+  gather(key="Factor",value="R",2:ncol(.))
+cor_p = corMat$P %>%
+  as_tibble() %>%
+  mutate(ME = rownames(corMat$P)) %>%
+  filter(ME %in% colnames(MEs)) %>%
+  select(ME,factors) %>%
+  gather(key="Factor",value="pvalue",2:ncol(.))
+cor_out = full_join(corCoefs,cor_p)
+
+glimpse(cor_out)
+```
+
+### Bubble Plot of Variance and Correlation Coefficients by Module
+
+To visualize all the patterns we've identified so far, I use a bubble diagram that shows each module, the estimated percent of variation from each factor, and the linear regression correlation coefficients.
+
+```{r vpa_all_bubble, fig.width=4, fig.height=4, message=FALSE}
+vp_tidy = vp_all 
+vp_tidy$ME = rownames(vp_all)
+vp_tidy = vp_tidy %>%
+  gather(key="Factor",value="Variance",1:ncol(vp_all)) %>%
+  left_join(cor_out)
+
+# This section gives me an ordered list of factors by their total variance explained
+# I use it to put my bubble plot rows in order, with most important by the axis labels
+order_factor = vp_tidy %>%
+  group_by(Factor) %>%
+  summarise(sum(Variance)) %>%
+  arrange(-`sum(Variance)`) 
+
+vp_tidy$Variance[vp_tidy$Variance<0.001]  = NA
+vp_tidy$Factor = factor(vp_tidy$Factor,levels = order_factor$Factor)
+
+ggplot(filter(vp_tidy,Factor!="Residuals"),aes(y=Factor,x=ME,size=Variance,fill=R)) +
+  geom_point(color="black",shape=21) +
+  theme_minimal() +
+  scale_fill_gradient2(low="blue",high="red2",mid = "white") +
+  ylab("") +
+  xlab("Module Eigenproteins") +
+  ggtitle("Module Variance by Clinical Factors") +
+  theme(plot.title = element_text(face="bold",hjust=0.5) )
+```
+
+### Proteins within modules
+
+To get an idea of the biological relevance of the modules, I'll put together a list of the top-correlated proteins in each module and run a gene set enrichment analysis for Gene Ontology Biological Processes in PANTHER 17.
+
+The module membership score, kME, is the correlation coefficient of each protein within the module to the module eigenprotein (ME), or first principal component of that module.
+
+```{r proteins, message=FALSE}
+# Create data frame of all protein identifiers (OnlinkID, UniProt, Assay)
+protein_codes = df_in %>%
+  select(OlinkID,Assay,UniProt) %>%
+  distinct()
+
+# Pull the kME values
+kME = WGCNA::signedKME(datExpr = obs_mat,datME = MEs) # wide format
+kME$OlinkID = rownames(kME) # add column for OlinkID
+kME_obs =  gather(kME,key="ME",value="kME",1:ncol(MEs)) # long format
+
+# Create data frame of proteins with the module they belong to (color and num)
+proteins = data.frame(OlinkID=names(net$unmergedColors),MEcol=net$colors)
+proteins$ME = color_code$colors_num[match(proteins$MEcol,color_code$color)] %>% 
+  str_c("kME",.)
+# add in their kME value and other identifiers (UnitProt, Assay)
+proteins_kME = left_join(proteins,kME_obs) %>%
+  left_join(protein_codes)
+
+# Select top module members (kME gated) for using in GSEA
+top_proteins = proteins_kME %>%
+  filter(kME > 0.6)
+table(top_proteins$ME)
+
+# # Export as csv files to use in PANTHER 17 GSEA web application 
+# dir.create("GSEA",showWarnings = FALSE)
+# rio::export(top_proteins,"GSEA/top_proteins.csv")
+# rio::export(proteins_kME$UniProt %>% as.matrix(),"GSEA/background_prot.csv")
+# lapply(unique(top_proteins$MEcol),function(x){
+#   export = top_proteins %>% filter(MEcol == x) 
+#   rio::export(export$UniProt %>% as.matrix(),
+#               file = paste0("GSEA/top_proteins_",unique(export$ME),"_",x,".csv"),sep=",")
+# }) %>% invisible()
+
+```
+
+### Module 1 Heatmap
+
+I was particularly interested in ME1 since it showed such a strong relationship with creatine and association with acuity as well. I used a heatmap to check out the pattern.
+
+```{r hm_1, fig.height=9,fig.width=8}
+purp = data.frame(code=1:5,col=RColorBrewer::brewer.pal(5,"Purples"))
+oran = data.frame(code=5:1,col=RColorBrewer::brewer.pal(5,"Blues"))
+col_creat = purp$col[match(info$creat,purp$code)]
+col_covid = case_when(info$COVID == 1 ~ "red",info$COVID == 0 ~ "skyblue")
+col_acuity = oran$col[match(info$Acuity,oran$code)]
+hm_mat = obs_mat[,proteins_kME$ME=="kME1"]
+hm_assay = proteins_kME$Assay[proteins_kME$ME=="kME1"]
+heatmap3::heatmap3(t(hm_mat),scale="none",
+                   ColSideColors = cbind(Creatine=col_creat,Acuity=col_acuity,`COVID+`=col_covid),
+                   labRow = hm_assay, labCol = "", cexRow = 0.5)
+```
+
+These Module 1 proteins seem to be elevated in cases with high creatine (darker purple) and worse acuity (darker blue = worse outcomes). These proteins may be contributing to worse outcomes in COVID+ patients. We'll use gene set enrichment to see what processes they're related to.
+
+### Gene set enrichment of modules
+
+Gene ontology was conducted for each of the 6 resulting WGCNA modules using the PANTHER 17.0 overrepresentation test, available on the [Gene Ontology Resource](http://geneontology.org/). The GO biological processes complete annotation set was used with Fisher's exact test and false discovery rate (FDR) corrected p-values. The test was applied using all UnitProt IDs with a network kME, or module connectivity, of at least 0.60 within the queried module and a background of the 1,472 proteins used to construct the network.
+
+```{r GSEA, message=FALSE}
+# Load all enrichment results
+GSEA_all = lapply(dir("GSEA/Panther Results"),function(file){
+  GSEA_results = read_tsv(paste0("GSEA/Panther Results/",file),skip = 11,show_col_types = FALSE)
+  colnames(GSEA_results) = c("GO_biological_process",
+                             "set_n_ref",
+                             "set_n_query_actual",
+                             "set_n_query_expected",
+                             "over_under",
+                             "fold_enrichment",
+                             "fishers_p",
+                             "padj_fdr")
+  GSEA_results = GSEA_results %>%
+    filter(padj_fdr < 0.5) %>%
+    mutate(fold_enrichment = as.numeric(fold_enrichment)) %>%
+    arrange(fold_enrichment) %>%
+    mutate(GO_biological_process = factor(GO_biological_process,
+                                          levels=GO_biological_process)) %>%
+    mutate(logp = -log(padj_fdr,10)) %>%
+    mutate(ME = substr(file,1,3))
+}) %>%
+  do.call(rbind,.)
+ 
+glimpse(GSEA_all)
+```
+
+### Module 2 GSEA
+
+Module 2 had the strongest results for GSEA.
+
+```{r GSEA_ME2,fig.height=5,fig.width=10}
+GSEA_ME2 = GSEA_all %>%
+  filter(ME=="ME2",padj_fdr<0.01,over_under=="+") %>%
+  arrange(fold_enrichment)
+GSEA_ME2$GO_biological_process = factor(GSEA_ME2$GO_biological_process, levels=GSEA_ME2$GO_biological_process)
+
+ggplot(GSEA_ME2,aes(x=GO_biological_process,y=fold_enrichment, size=set_n_query_actual,label=signif(padj_fdr,1),color=logp)) +
+  geom_point() +
+  coord_flip() +
+  geom_text(hjust=-0.2,size=4) +
+  expand_limits(y=3) +
+  xlab("") +
+  ylab("Fold Enrichment") +
+  ggtitle("Enriched Biological Processes in Module 2") +
+  cowplot::theme_cowplot() +
+  theme(plot.title = element_text(face="bold",hjust=1,size=16)) +
+  scale_color_gradient(low="blue",high="red",name="FDR p (-log10)") +
+  scale_size(name="Enriched Proteins") 
+```
+
+### Compare with plasma snRNAseq reference set
+
+The next question I asked was which cell types might be involved in the protein expression patterns within each module. To answer this, I extracted the cell type-specific markers from a human peripheral blood mononuclear cell (PBMC) data set of COVID +/- patients and assess the enrichment of these markers within each module. I used [this study](https://www.nature.com/articles/s41591-020-0944-y) [@wilk2020].
+
+#### Reproduce the UMAP
+
+First, I uploaded the data set and ensured that I could reproduce the UMAP cell type projection.
+
+```{r blish_load, fig.height=5,fig.width=8,message=FALSE}
+blish = readRDS("blish_covid.seu.rds")
+Seurat::DimPlot(blish,group.by = "cell.type.fine",label = TRUE, repel=TRUE) 
+Seurat::Idents(blish) = "cell.type.fine"
+```
+
+#### Calculate cell type markers
+
+```{r blish_markers,eval=FALSE}
+blish.markers <- Seurat::FindAllMarkers(blish, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+# saveRDS(blish.markers,"blish.markers.rds")
+```
+
+```{r load_blish_markers,include=FALSE}
+blish.markers = readRDS("blish.markers.rds")
+```
+
+#### Extracted shared proteins between modules and scRNAseq data
+
+```{r matched_markers_blish}
+blish.markers.match = blish.markers[which(protein_codes$Assay %in% blish.markers$gene),]
+glimpse(blish.markers.match)
+```
+
+There are `r dim(blish.markers.match)[1]` shared proteins between the cell type markers list and the module proteins list (including module 0).
+
+#### Create table of matched markers by module
+
+```{r markertable}
+proteins_kME_ct = proteins_kME %>%
+  left_join(select(blish.markers,gene,cluster),by=c("Assay" = "gene"))
+markerTable = with(proteins_kME_ct,table(cluster,ME))
+marker_df = as.data.frame.matrix(markerTable)
+markerTable
+```
+
+#### Conduct overrepresentation analysis by cell type
+
+```{r overrep_test}
+# Create a data frame of cell type markers by module, long format
+# For use in overrepresentation test
+marker_counts = marker_df %>%
+  as.tibble() %>%
+  mutate(CellType = rownames(marker_df)) %>%
+  # convert to long format
+  gather(key="ME",value="count",1:ncol(marker_df)) %>% 
+  # Create column for number of proteins in cell type list
+  group_by(CellType) %>% 
+  mutate(ct_total = sum(count)) %>%
+  ungroup() %>%
+  # Create column for number of proteins in module list
+  group_by(ME) %>%
+  mutate(mod_total = sum(count)) %>%
+  ungroup() %>%
+  # Create column for background number of proteins
+  mutate(bkgd = sum(count)) %>%
+  # Expected count is % of all proteins in cell type times module size
+  mutate(expected_count = mod_total * ct_total / bkgd) %>%
+  # Fold Enirchment is actual count divided by expected count
+  mutate(FE = log2(count/expected_count))
+# Fold Enrichment is -Inf for counts = 0 (log2), so set to NA
+marker_counts$FE[marker_counts$count == 0] = NA
+# Remove the leftover "K" from kME
+marker_counts$ME = substr(marker_counts$ME,start=2,4)
+
+glimpse(marker_counts)
+```
+
+#### Number of markers for each cell type
+
+```{r ct_table}
+marker_counts %>%
+  select(CellType,ct_total) %>%
+  distinct()
+```
+
+
+#### Visualize Fold Enrichment of cell types within each module with bubble plot
+
+```{r celltype_vis, fig.height=4, fig.width=5.5}
+# Order cell types by greatest fold enrichment values
+order_ct = marker_counts %>%
+  group_by(CellType) %>%
+  summarise(sum(abs(FE),na.rm = TRUE)) %>%
+  arrange(-`sum(abs(FE), na.rm = TRUE)`)
+
+marker_counts$CellType = factor(marker_counts$CellType,levels = order_ct$CellType)
+
+ggplot(marker_counts,aes(y=CellType,x=ME,size=abs(FE),fill=FE)) +
+  geom_point(color="black",shape=21) +
+  theme_minimal() +
+  scale_fill_gradient2(mid="white",high="red2",low="blue") +
+  ylab("") +
+  xlab("Module Eigenproteins") +
+  labs(size="abs(Fold Enrichment)",fill="Fold Enrichment") +
+  ggtitle("Module Cell Type Enrichment") +
+  theme(plot.title=element_text(face="bold",hjust=0.5))
+```
+
+I'm interested to see CD4m T cell markers in ME3 (memory T-cells? unclear from the publication), as well as gamma delta T cell markers and CD4n T cell markers. ME4 seems enriched for red blood cell markers. ME1 has a distinct lack of platelet markers (but that list was small, with only 4 markers).
+
+#### Citations
